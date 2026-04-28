@@ -3,12 +3,13 @@ from enum import Enum
 import json
 import logging
 from utils.logger import setup_logger
+from skills import get_available_skills
 
 logger = setup_logger(level=logging.DEBUG)
 
 """
 是否启用调试模式
-更详细的日志打印，浏览器操作可视化等
+更详细的日志打印
 """
 DEBUG = True
 config = None
@@ -43,25 +44,59 @@ def get_config():
     if config:
         return config
 
+    defaultSkillName = "random_dynamic_emoji"
+
+    defaultSkillConfig = {
+        "dynamic_emoji_type": ["续火花"],
+    }
+    if (
+        os.getenv("SKILL")
+        and os.getenv("SKILL") in get_available_skills()
+        and os.getenv(f"SKILL_{os.getenv('SKILL').upper()}")
+    ):
+        skill_name = os.getenv("SKILL")
+        skill_config_str = os.getenv(f"SKILL_{skill_name.upper()}", "{}")
+        try:
+            skill_config = json.loads(skill_config_str)
+
+            skill = {"name": skill_name, "config": skill_config}
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"技能 {skill_name} 的配置解析失败，已使用默认random_dynamic_emoji skill 以及 默认配置: {e}"
+            )
+            skill_config = defaultSkillConfig
+            skill = {"name": defaultSkillName, "config": skill_config}
+    else:
+        skill = {"name": defaultSkillName, "config": defaultSkillConfig}
+
     config = {
         "proxyAddress": os.getenv("PROXY_ADDRESS", ""),
-        "messageTemplate": os.getenv("MESSAGE_TEMPLATE", "[盖瑞]今日火花[加一]\\n—— [右边] 每日一言 [左边] ——\\n[API]"),
-        "hitokotoTypes": json.loads(
-            os.getenv("HITOKOTO_TYPES", '["文学","影视","诗词","哲学"]')
-        ),
-        "matchMode": os.getenv("MATCH_MODE", "nickname"),  # 是否使用短 ID 进行好友匹配
-        "browserTimeout": int(os.getenv("BROWSER_TIMEOUT", "120000")),  # 浏览器操作超时时间，单位毫秒
-        "friendListTimeout": int(os.getenv("FRIEND_LIST_WAIT_TIME", "2000")),  # 好友列表加载超时时间，单位毫秒
-        "taskRetryTimes": int(os.getenv("TASK_RETRY_TIMES", "3")),  # 任务重试次数
         "logLevel": os.getenv("LOG_LEVEL", "DEBUG"),  # 日志级别
+        "skill": skill
     }
 
     return config
 
-def sanitize_cookies(cookies):
-    for cookie in cookies:
-        if "sameSite" in cookie:
-            cookie.pop("sameSite")  # 移除 sameSite 字段，Playwright 可能不支持该字段
+
+def parse_cookies_str(cookies_str):
+    """
+    将 cookies 字符串解析为字典
+    :param cookies_str: cookies 字符串，格式为 "key1=value1; key2=value2; ..."
+    :return: cookies 字典
+    """
+    cookies = {}
+    for item in cookies_str.split(";"):
+        if "=" in item:
+            key, value = item.strip().split("=", 1)
+            cookies[key] = value
+
+    # 校验cookie中必须有的值：ms_token s_v_web_id UIFID
+    required_keys = ["ms_token", "s_v_web_id", "UIFID"]
+    for key in required_keys:
+        if key not in cookies:
+            print(f"Cookie 中缺少必需的字段: {key}")
+            raise ValueError(f"Cookie 中缺少必需的字段: {key}")
+
     return cookies
 
 
@@ -81,30 +116,36 @@ def get_userData():
 
     for task in tasks:
         username = task.get("username", "未知用户")
-        unique_id = task.get("unique_id")
-        if not unique_id:
-            logger.warning(f"{username} 的任务  缺少 unique_id 字段，已跳过")
+        user_id = task.get("user_id")
+        if not user_id:
+            logger.warning(f"{username} 的任务  缺少 user_id 字段，已跳过")
             continue
-        cookies_key = f"cookies_{unique_id}".upper()
-        cookies_str = (
-            os.getenv(cookies_key, "").encode("utf-8").decode("unicode_escape")
-        )
+        cookies_key = f"cookies_{user_id}".upper()
+        cookies_str = os.getenv(cookies_key, "")
         if not cookies_str:
-            logger.warning(
-                f"{username} 的任务 缺少 {cookies_key} 环境变量，已跳过"
-            )
+            logger.warning(f"{username} 的任务 缺少 {cookies_key} 环境变量，已跳过")
             continue
         try:
-            cookies = json.loads(cookies_str)
-        except json.JSONDecodeError:
-            logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
+            cookies = parse_cookies_str(cookies_str.strip())
+        except Exception as e:
+            logger.warning(
+                f"{username} 的任务 cookies 环境变量格式错误，解析失败，已跳过: {e}"
+            )
+            continue
+        
+        session_id_key = f"SESSIONID_{user_id}".upper()
+        session_id = os.getenv(session_id_key, "")
+        
+        if not session_id:
+            logger.warning(f"{username} 的任务 缺少 {session_id_key} 环境变量，已跳过")
             continue
 
         userData.append(
             {
-                "unique_id": unique_id,
-                "username": username,
-                "cookies": sanitize_cookies(cookies),
+                "user_id": user_id.strip(),
+                "session_id": session_id.strip(),
+                "username": username.strip(),
+                "cookies": cookies,
                 "targets": task.get("targets", []),
             }
         )

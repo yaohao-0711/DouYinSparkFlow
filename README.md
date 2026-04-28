@@ -6,7 +6,88 @@
 ![Playwright](https://img.shields.io/badge/Playwright-%E2%9C%94-green?logo=playwright)
 ![chrome-headless-shell](https://img.shields.io/badge/chrome--headless--shell-%E2%9C%94-brightgreen?logo=googlechrome)
 
-> `dev`分支迁移到`https://www.douyin.com/chat` 加载更稳定，支持通过备注/昵称/抖音号等多种方式智能匹配。由于`https://www.douyin.com/chat`没经过长期测试，该分支目前暂不合并。有能力的可以研究一下
+## API 测试分支使用说明
+
+本分支相关能力依赖仓库 [douyin-web-api-sdk](https://github.com/Rockedw/douyin-web-api-sdk)，使用即代表同意其条款和约定。
+
+> 重要提醒
+> 1. 本项目不涉及接口破解或逆向抖音代码，相关能力来源于网络资料，请自行评估风险。
+> 2. 本项目仅用于学习交流，请勿大规模宣传、商用或售卖。
+> 3. 如出现不可控风险，项目可能随时删库或停止维护。
+
+### 1. 启用工作流
+
+在 GitHub Actions 中启用最新的 `.github/workflows/schedule_api.yml` 工作流：
+`【api（测试）分支】DouYin Spark Flow Schedule Run`
+
+### 2. 配置 Environment Variables
+
+需要在 Action 的环境变量中至少配置以下字段：
+
+- `SKILL`：技能名称，允许值为 `human_like_sim`、`random_dynamic_emoji`、`random_hot_video`、`hitokoto`
+- `SKILL_{SKILL名大写}`：对应技能的 JSON 配置（建议配置）
+- `TASKS`：任务配置 JSON（必填）
+- `LOG_LEVEL`：日志等级（与 `main` 分支一致）
+
+示例：
+
+```txt
+SKILL=human_like_sim
+SKILL_HUMAN_LIKE_SIM={"video_type":["影视","美食","小剧场","动物","游戏","二次元"],"dynamic_emoji_type":["续火花","比心"],"video_probability":0.3}
+```
+
+不同技能常用配置示例：
+
+```txt
+SKILL=random_dynamic_emoji
+SKILL_RANDOM_DYNAMIC_EMOJI={"dynamic_emoji_type":["续火花","比心","在干嘛"]}
+
+SKILL=random_hot_video
+SKILL_RANDOM_HOT_VIDEO={"video_type":["影视","游戏","二次元"]}
+
+SKILL=hitokoto
+SKILL_HITOKOTO={"hitokoto_type":["不限","影视"],"message_template":"[盖瑞]今日火花[加一]\n[API]"}
+```
+
+### 3. 配置 `TASKS`
+
+`TASKS` 的值是一个 JSON 数组，格式示例：
+
+```json
+[
+  {
+    "username": "任务账户名称",
+    "user_id": "108986587854",
+    "targets": [
+      {
+        "remark": "备注名称",
+        "conversation_id": "1:1:1234567890:9876543210",
+        "conversation_short_id": "1234567890123456789",
+        "is_group": false
+      }
+    ]
+  }
+]
+```
+
+- `is_group`：是否群聊，群聊填 `true`，私聊填 `false`
+- `conversation_id`、`conversation_short_id`、`user_id` 可通过脚本 [hook.js](hook.js) 获取
+
+获取方式：
+
+1. 打开 [www.douyin.com/chat](https://www.douyin.com/chat)
+2. 在浏览器控制台粘贴并执行 `hook.js`
+3. 打开目标会话，手动发送任意消息
+4. 控制台会输出 `conversationId`、`conversationShortId`、`user_id`、`cookies`
+
+注意：控制台输出字段是驼峰命名（如 `conversationId`），写入 `TASKS` 时请改为下划线字段（如 `conversation_id`）。
+
+### 4. 配置 Secrets
+
+- `COOKIES_{user_id}`：例如 `COOKIES_108986587854`，值使用 `hook.js` 输出的 `cookies`，必须放在 Secrets 中避免泄露
+- `SESSIONID_{user_id}`：例如 `SESSIONID_108986587854`，值为浏览器 Cookie 中名为 `sessionid` 的值（可在开发者工具 Application/Cookies 查看）
+
+需要每个账号都按 `user_id` 维度独立配置 `COOKIES_{user_id}` 与 `SESSIONID_{user_id}`，便于多账号并行任务管理。
 
 ## 贡献者
 
