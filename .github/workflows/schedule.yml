@@ -2,7 +2,7 @@ name: DouYin Spark Flow Schedule Run
 on:
   workflow_dispatch: # 允许手动触发
   schedule: # 定时任务
-    - cron: "0 1 * * *" # 每天 1:00 UTC（对应北京时间 9:00）
+    - cron: "0 3 * * *" # 每天 1:00 UTC（对应北京时间 11:00）
 jobs:
   run-main:
     timeout-minutes: 20
@@ -28,6 +28,11 @@ jobs:
         VARS_JSON: ${{ toJson(vars) }}
         SECRETS_JSON: ${{ toJson(secrets) }}
       run: python utils/export_github_env.py
+    - name: Pick random emoji
+      run: |
+        EMOJIS=("[加一]" "[爱心]" "[666]" "[庆祝]")
+        RANDOM_EMOJI=${EMOJIS[$RANDOM % 4]}
+        echo "MESSAGE_TEMPLATE=$RANDOM_EMOJI" >> $GITHUB_ENV
     - name: Run DouYin Spark Flow
       run: python main.py
     - uses: actions/upload-artifact@v4
