@@ -3,6 +3,7 @@ from utils.logger import setup_logger
 from utils.config import get_config, get_userData
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
+from core.send_api import discover_and_send
 from playwright.sync_api import Response
 import time
 import json
@@ -247,58 +248,9 @@ def do_user_task(browser, username, cookies, targets):
 
         account_name = username  # 保存账号名，避免被下方循环变量覆盖
         logger.info(f"账号 {account_name} 开始发送消息")
-        os.makedirs("logs", exist_ok=True)  # 确保日志/截图目录存在
-        # 滚动并选择用户
-        fail_idx = 0  # 发送失败截图计数器
-        for friend_name in scroll_and_select_user(page, account_name, targets):
-            logger.info(f"账号 {account_name} 已选中好友「{friend_name}」，准备发送消息")
-            # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
-            chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
-            page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
-            chat_input = page.locator(chat_input_selector)
-
-            # 在 chat-input-dccKiL 中输入内容
-            message = build_message()
-            for line in message.split("\\n"):
-                chat_input.type(line)  # 输入每一行
-                # 如果不是最后一行，模拟 Shift+Enter 插入换行
-                if line != message.split("\\n")[-1]:
-                    chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
-
-            logger.debug(
-                f"账号 {account_name} 准备发送消息给好友「{friend_name}」：\n\t{message}"
-            )
-            # 模拟按下回车键发送消息
-            chat_input.press("Enter")
-            logger.info(f"账号 {account_name} 已向好友「{friend_name}」发送消息，等待送达确认")
-
-            # [B方案] 降速：加大发送间隔，降低抖音限流/风控导致的静默失败
-            send_interval = int(config.get("sendInterval", 8000)) / 1000
-            time.sleep(send_interval)
-
-            # [B方案] 送达校验：检测发送失败提示，未失败时视为已送达
-            try:
-                fail_xpath = (
-                    "xpath=//*[contains(text(),'发送失败') "
-                    "or contains(text(),'发送频繁') "
-                    "or contains(text(),'网络异常')]"
-                )
-                if page.locator(fail_xpath).count() > 0:
-                    fail_idx += 1
-                    logger.warning(
-                        f"账号 {account_name} 给好友「{friend_name}」发送后检测到失败提示，可能未送达！"
-                    )
-                    try:
-                        page.screenshot(path=f"logs/send_fail_{fail_idx}.png")
-                    except Exception:
-                        pass
-                else:
-                    logger.info(
-                        f"账号 {account_name} 给好友「{friend_name}」发送后未发现失败提示（视为已送达）"
-                    )
-            except Exception as e:
-                logger.warning(f"账号 {account_name} 送达校验异常: {e}")
-
+        # 抗改版方案：通过 API 发现会话 + 原生发送（不再依赖脆弱的 XPath 点击好友标签）
+        config["_account_name"] = account_name
+        discover_and_send(page, targets, userIDDict, matchMode, build_message, config)
         context.close()  # 任务完成后关闭上下文
 
 
