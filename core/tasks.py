@@ -3,7 +3,7 @@ from utils.logger import setup_logger
 from utils.config import get_config, get_userData
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
-from core.send_api import discover_and_send
+from core.send_api import discover_and_send, install_list_capture
 from playwright.sync_api import Response
 import time
 import json
@@ -237,6 +237,10 @@ def do_user_task(browser, username, cookies, targets):
         # 注入 Cookie
         context.add_cookies(cookies)
 
+        # 关键：在导航到聊天页【之前】挂上列表捕获监听器，确保能抓到 conversation/list
+        list_store = {}
+        install_list_capture(page, list_store)
+
         # 导航到消息页面
         retry_operation(
             "导航到消息页面",
@@ -250,7 +254,7 @@ def do_user_task(browser, username, cookies, targets):
         logger.info(f"账号 {account_name} 开始发送消息")
         # 抗改版方案：通过 API 发现会话 + 原生发送（不再依赖脆弱的 XPath 点击好友标签）
         config["_account_name"] = account_name
-        discover_and_send(page, targets, userIDDict, matchMode, build_message, config)
+        discover_and_send(page, targets, userIDDict, matchMode, build_message, config, list_store=list_store)
         context.close()  # 任务完成后关闭上下文
 
 
@@ -280,6 +284,3 @@ def runTasks():
         browser.close()
         
         playwright.stop()
-
-        
-
