@@ -6,6 +6,7 @@ from core.browser import get_browser
 from playwright.sync_api import Response
 import time
 import json
+import os
 
 
 complates = {}
@@ -244,10 +245,13 @@ def do_user_task(browser, username, cookies, targets):
             url="https://creator.douyin.com/creator-micro/data/following/chat",
         )
 
-        logger.debug(f"账号 {username} 开始发送消息")
+        account_name = username  # 保存账号名，避免被下方循环变量覆盖
+        logger.info(f"账号 {account_name} 开始发送消息")
+        os.makedirs("logs", exist_ok=True)  # 确保日志/截图目录存在
         # 滚动并选择用户
-        for username in scroll_and_select_user(page, username, targets):
-            logger.debug(f"账号 {username} 已选中好友 {username} 发送消息")
+        fail_idx = 0  # 发送失败截图计数器
+        for friend_name in scroll_and_select_user(page, account_name, targets):
+            logger.info(f"账号 {account_name} 已选中好友「{friend_name}」，准备发送消息")
             # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
             chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
             page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
@@ -262,12 +266,38 @@ def do_user_task(browser, username, cookies, targets):
                     chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
 
             logger.debug(
-                f"账号 {username} 准备发送消息给好友 {username}：\n\t{message}"
+                f"账号 {account_name} 准备发送消息给好友「{friend_name}」：\n\t{message}"
             )
-            logger.debug(f"账号 {username} 给好友 {username} 发送消息完成")
             # 模拟按下回车键发送消息
             chat_input.press("Enter")
-            time.sleep(2)  # 发送完等待一会儿
+            logger.info(f"账号 {account_name} 已向好友「{friend_name}」发送消息，等待送达确认")
+
+            # [B方案] 降速：加大发送间隔，降低抖音限流/风控导致的静默失败
+            send_interval = int(config.get("sendInterval", 8000)) / 1000
+            time.sleep(send_interval)
+
+            # [B方案] 送达校验：检测发送失败提示，未失败时视为已送达
+            try:
+                fail_xpath = (
+                    "xpath=//*[contains(text(),'发送失败') "
+                    "or contains(text(),'发送频繁') "
+                    "or contains(text(),'网络异常')]"
+                )
+                if page.locator(fail_xpath).count() > 0:
+                    fail_idx += 1
+                    logger.warning(
+                        f"账号 {account_name} 给好友「{friend_name}」发送后检测到失败提示，可能未送达！"
+                    )
+                    try:
+                        page.screenshot(path=f"logs/send_fail_{fail_idx}.png")
+                    except Exception:
+                        pass
+                else:
+                    logger.info(
+                        f"账号 {account_name} 给好友「{friend_name}」发送后未发现失败提示（视为已送达）"
+                    )
+            except Exception as e:
+                logger.warning(f"账号 {account_name} 送达校验异常: {e}")
 
         context.close()  # 任务完成后关闭上下文
 
