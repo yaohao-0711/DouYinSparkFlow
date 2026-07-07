@@ -5,6 +5,6 @@ if os.path.exists(".env"):
 
     load_dotenv(".env")
 
-from core.tasks import runTasks
+from capture_api import main as capture_main
 
-runTasks()
+capture_main()
