@@ -47,6 +47,24 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
     logger.info(f"[{account}] 等待聊天页加载 (5s)...")
     time.sleep(5)
 
+    # ---- 登录态检测（Cookie 失效是最常见的根因）----
+    try:
+        is_login = page.evaluate("""() => {
+            const txt = (document.body && document.body.innerText) || '';
+            const loginMark = /扫码登录|验证码登录|密码登录|登录或注册/.test(txt);
+            const loginCard = !!document.querySelector('[class*=login-card], [class*=douyin_login], [class*=passport]');
+            return loginMark || loginCard;
+        }""")
+    except Exception as e:
+        logger.warning(f"[{account}] 登录态检测异常: {e}")
+        is_login = False
+
+    if is_login:
+        logger.error(f"[{account}] !!! 未登录：页面停留在抖音登录界面，Cookie 已失效/过期/域名不匹配")
+        logger.error(f"[{account}] !!! 请重新从 creator.douyin.com 导出 Cookie（Cookie-Editor 插件），并更新 GitHub Secret COOKIES_28860838926")
+        logger.error(f"[{account}] !!! 未登录时无法发送任何消息，流程终止")
+        raise RuntimeError(f"[{account}] 未登录，Cookie 失效，请更新 COOKIES_28860838926")
+
     # ---- 导出完整 DOM ----
     try:
         html = page.content()
