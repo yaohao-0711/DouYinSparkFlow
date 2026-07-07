@@ -1,10 +1,11 @@
 """
-send_api.py — 抖音续火花「抗改版」发送模块 (v2.1 诊断增强)
-=========================================================
-本轮重点：把聊天页加载期间所有 imapi.douyin.com 响应（URL + 完整 body）
-都落盘到 logs/imapi/，用于离线定位“会话列表”真实接口与报文格式，
-下一轮再据此写精确的 conversation_id 解析。同时保留：
-- 优先 conversation_id 打开会话；失败按昵称文本点击（抗布局改版）。
+send_api.py — 抖音续火花「抗改版」发送模块 (v2.2 DOM 抓取版)
+===========================================================
+关键修正（基于 run#17 诊断）：
+- 会话列表【不是】独立 imapi 接口，而是直接渲染在聊天页左侧 DOM 中。
+- 因此改为：从聊天页 DOM 抓取会话列表（好友昵称 + conversation_id/href），
+  用昵称/short_id 匹配目标，优先按 conversation_id 直接打开（最稳），
+  否则按昵称文本点击（抗布局改版）。
 - 原生输入框发送 + 送达校验。
 - 任意好友失败则抛异常，让 workflow 真正标记失败（杜绝假成功）。
 """
@@ -16,12 +17,11 @@ import json
 import logging
 from utils.logger import setup_logger
 
-# 与 tasks.py 共用同一个 app.log 文件，确保日志不丢失
 logger = setup_logger("send_api", level="Info")
 
 
 # ---------------------------------------------------------------------------
-# 通用 protobuf 解码器
+# 通用 protobuf 解码器（兼容接口返回 protobuf 的情况）
 # ---------------------------------------------------------------------------
 def _read_varint(b, p):
     shift = 0
@@ -64,35 +64,6 @@ def _decode_proto(b):
     return out
 
 
-def decode_proto_text(b):
-    try:
-        def stringify(nodes, depth=0):
-            lines = []
-            for nd in nodes:
-                f, t, v = nd[0], nd[1], nd[2]
-                if t == "ld":
-                    try:
-                        s = v.decode("utf-8")
-                        if any(32 <= ord(c) < 127 or ord(c) > 127 for c in s):
-                            lines.append(("  " * depth) + "f%d ld STR=%r" % (f, s[:400]))
-                            continue
-                    except Exception:
-                        pass
-                    try:
-                        sub = stringify(_decode_proto(v), depth + 1)
-                        lines.append(("  " * depth) + "f%d ld {" % f)
-                        lines.extend(sub)
-                    except Exception:
-                        lines.append(("  " * depth) + "f%d ld <bytes %d>" % (f, len(v)))
-                else:
-                    lines.append(("  " * depth) + "f%d %s %r" % (f, t, v))
-            return lines
-
-        return "\n".join(stringify(_decode_proto(b)))
-    except Exception as e:  # pragma: no cover
-        return "decode error: %r" % e
-
-
 def _all_strings(nodes):
     res = []
     for nd in nodes:
@@ -112,232 +83,90 @@ def _all_strings(nodes):
 
 
 # ---------------------------------------------------------------------------
-# 结构化解析：从列表接口提取 好友 -> 会话 信息
+# 从聊天页 DOM 抓取会话列表（核心抗改版手段）
 # ---------------------------------------------------------------------------
-def _looks_like_name(s):
-    if not s or len(s) > 30:
-        return False
-    if any(ch in s for ch in "/\\.:@#%&?=http"):
-        return False
-    if re.fullmatch(r"\d+", s):
-        return False
-    if s.lower().startswith("http"):
-        return False
-    return True
-
-
-def _extract_conversation_id(strings):
-    for s in strings:
-        m = re.search(r"\d+:\d+:\d+:\d+", s)
-        if m:
-            return m.group(0)
-    for s in strings:
-        m = re.search(r"\b(\d{15,22})\b", s)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _extract_ids(strings):
-    short_id = None
-    user_id = None
-    for s in strings:
-        for m in re.finditer(r"\b(\d{8,22})\b", s):
-            d = m.group(1)
-            if short_id is None and 8 <= len(d) <= 13:
-                short_id = d
-            elif user_id is None and len(d) >= 14:
-                user_id = d
-    return short_id, user_id
-
-
-def _extract_nickname(strings):
-    for s in strings:
-        if _looks_like_name(s):
-            return s
-    return None
-
-
-def _json_walk_strings(obj, out):
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _json_walk_strings(v, out)
-    elif isinstance(obj, list):
-        for v in obj:
-            _json_walk_strings(v, out)
-    elif isinstance(obj, str):
-        out.append(obj)
-
-
-def _json_conversations(data):
-    candidates = []
-    if isinstance(data, list):
-        candidates = [x for x in data if isinstance(x, dict)]
-    elif isinstance(data, dict):
-        for key in ("conversation_list", "list", "conversations", "data"):
-            v = data.get(key)
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                candidates = v
-                break
-        if not candidates:
-            candidates = [data]
-    out = []
-    for c in candidates:
-        strings = []
-        _json_walk_strings(c, strings)
-        cid = _extract_conversation_id(strings)
-        sid, uid = _extract_ids(strings)
-        nm = _extract_nickname(strings)
-        if cid or nm or sid or uid:
-            out.append({
-                "conversation_id": cid,
-                "short_id": sid,
-                "user_id": uid,
-                "nickname": nm,
-                "_all_strings": strings[:60],
-            })
-    return out
-
-
-def parse_conversations(list_bytes):
-    out = []
-    if not list_bytes:
-        return out
-    stripped = list_bytes.lstrip()
-    if stripped[:1] in (b"{", b"["):
-        try:
-            data = json.loads(list_bytes.decode("utf-8", "replace"))
-            convs = _json_conversations(data)
-            if convs:
-                return convs
-        except Exception:
-            pass
-    try:
-        nodes = _decode_proto(list_bytes)
-    except Exception:
-        return out
-    for f, t, v in nodes:
-        if t != "ld":
-            continue
-        try:
-            sub_nodes = _decode_proto(v)
-        except Exception:
-            sub_nodes = []
-        strings = _all_strings(sub_nodes)
-        if not strings:
-            continue
-        cid = _extract_conversation_id(strings)
-        short_id, user_id = _extract_ids(strings)
-        nickname = _extract_nickname(strings)
-        if cid or nickname or short_id or user_id:
-            out.append({
-                "conversation_id": cid,
-                "short_id": short_id,
-                "user_id": user_id,
-                "nickname": nickname,
-                "_all_strings": strings[:60],
-            })
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 列表接口捕获（诊断增强：记录所有 imapi 响应）
-# ---------------------------------------------------------------------------
-def install_list_capture(page, store):
+def scrape_conversations_dom(page):
     """
-    必须在 page.goto(chat) 【之前】调用。
-    记录聊天页加载期间所有 imapi.douyin.com 响应（URL + 完整 body），
-    同时尝试按常见关键字识别“会话列表”接口。
+    从聊天页左侧会话列表 DOM 中提取条目。
+    每条：{nickname, conversation_id, uid, href}
+    同时把原始结构 dump 到 logs/dom_summary.json 供离线精修。
     """
-    store.setdefault("all_calls", [])
-    store.setdefault("imapi_calls", [])
-    store.setdefault("idx", 0)
-
-    def on_response(response):
-        url = response.url
-        try:
-            if "douyin.com" in url:
-                store["all_calls"].append({
-                    "url": url, "status": response.status,
-                })
-            if "imapi.douyin.com" in url:
-                try:
-                    body = response.body() or b""
-                except Exception:
-                    body = b""
-                idx = store["idx"]
-                store["idx"] += 1
-                store["imapi_calls"].append({
-                    "i": idx, "url": url, "status": response.status, "len": len(body),
-                })
-                # 落盘所有 imapi 响应体，供离线分析（限大小/数量）
-                if idx <= 40 and len(body) <= 300 * 1024:
-                    try:
-                        os.makedirs("logs/imapi", exist_ok=True)
-                        open("logs/imapi/%d.bin" % idx, "wb").write(body)
-                    except Exception:
-                        pass
-                # 尝试识别会话列表
-                if store.get("list") is None and (
-                    "conversation" in url or "/list" in url or "get_by_user" in url
-                ):
-                    store["list"] = body
-                    store["list_url"] = url
-                    try:
-                        os.makedirs("logs", exist_ok=True)
-                        open("logs/list_proto.bin", "wb").write(body)
-                        open("logs/list_proto.txt", "w", encoding="utf-8").write(
-                            decode_proto_text(body)
-                        )
-                        open("logs/list_strings.txt", "w", encoding="utf-8").write(
-                            "\n".join(_all_strings(_decode_proto(body)))
-                        )
-                        logger.info("已捕获会话列表接口：%s (%d bytes)" % (url, len(body)))
-                    except Exception as e:
-                        logger.warning("写入列表日志失败: %r" % e)
-        except Exception:
-            pass
-
-    page.on("response", on_response)
-    return store
-
-
-def capture_conversations(page, timeout_ms=8000):
-    captured = {}
-
-    def on_response(response):
-        url = response.url
-        try:
-            if (
-                "imapi.douyin.com" in url
-                and ("conversation" in url or "/list" in url or "get_by_user" in url)
-                and captured.get("list") is None
-            ):
-                try:
-                    body = response.body() or b""
-                except Exception:
-                    body = b""
-                captured["list"] = body
-                try:
-                    os.makedirs("logs", exist_ok=True)
-                    open("logs/list_proto.bin", "wb").write(body)
-                    open("logs/list_proto.txt", "w", encoding="utf-8").write(
-                        decode_proto_text(body)
-                    )
-                    open("logs/list_strings.txt", "w", encoding="utf-8").write(
-                        "\n".join(_all_strings(_decode_proto(body)))
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    page.on("response", on_response)
+    os.makedirs("logs", exist_ok=True)
+    result = {"data": None, "error": None}
     try:
-        page.wait_for_timeout(timeout_ms)
+        data = page.evaluate(
+            """() => {
+                const out = {hrefs: [], items: [], scripts_hint: []};
+                document.querySelectorAll('a').forEach(a => {
+                    const h = a.getAttribute('href') || '';
+                    if (h.indexOf('conversation') >= 0 || h.indexOf('chat') >= 0) {
+                        out.hrefs.push({href: h, text: (a.innerText||'').trim().slice(0,50)});
+                    }
+                });
+                const sels = ['[class*="conversation"]','[class*="Conversation"]',
+                              '[class*="list-item"]','[class*="chat-item"]',
+                              '[class*="im-item"]','[class*="friend"]','li'];
+                const seen = new Set();
+                sels.forEach(sel => {
+                    document.querySelectorAll(sel).forEach(e => {
+                        const txt = (e.innerText||'').trim().slice(0,50);
+                        if (!txt) return;
+                        const cls = (e.className||'').toString();
+                        const key = txt + '|' + cls.slice(0,40);
+                        if (seen.has(key)) return; seen.add(key);
+                        out.items.push({
+                            cls: cls.slice(0,60),
+                            text: txt,
+                            href: e.getAttribute('href') || '',
+                            cid: e.getAttribute('data-conversation-id') || e.getAttribute('data-cid') || e.getAttribute('data-id') || '',
+                            uid: e.getAttribute('data-uid') || e.getAttribute('data-user-id') || e.getAttribute('data-userid') || ''
+                        });
+                    });
+                });
+                return out;
+            }"""
+        )
+        result["data"] = data
+    except Exception as e:
+        result["error"] = repr(e)
+
+    try:
+        with open("logs/dom_summary.json", "w", encoding="utf-8") as fp:
+            json.dump(result, fp, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    return captured.get("list")
+
+    items = []
+    if result.get("data"):
+        for it in result["data"].get("items", []):
+            cid = it.get("cid") or ""
+            if not cid and it.get("href"):
+                m = re.search(r"conversation_id=([^&?#]+)", it["href"])
+                if m:
+                    cid = m.group(1)
+            uid = it.get("uid") or ""
+            if not uid and it.get("href"):
+                m = re.search(r"[?&/](uid|user_id|to_user_id)=([^&?#]+)", it["href"])
+                if m:
+                    uid = m.group(2)
+            nickname = it.get("text")
+            if nickname or cid:
+                items.append({
+                    "nickname": nickname,
+                    "conversation_id": cid,
+                    "uid": uid,
+                    "href": it.get("href"),
+                })
+        for h in result["data"].get("hrefs", []):
+            m = re.search(r"conversation_id=([^&?#]+)", h["href"])
+            if m and h.get("text"):
+                items.append({
+                    "nickname": h["text"],
+                    "conversation_id": m.group(1),
+                    "uid": "",
+                    "href": h["href"],
+                })
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -425,58 +254,34 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
     chat_url = "https://creator.douyin.com/creator-micro/data/following/chat"
     account_name = config.get("_account_name", "账号")
     os.makedirs("logs", exist_ok=True)
-    store = list_store or {}
 
-    # 0) 保存诊断清单（所有 douyin / imapi 调用）
-    try:
-        with open("logs/imapi_calls.json", "w", encoding="utf-8") as fp:
-            json.dump({
-                "all_douyin_calls": store.get("all_calls", []),
-                "imapi_calls": store.get("imapi_calls", []),
-            }, fp, ensure_ascii=False, indent=2)
-        logger.info("诊断：捕获到 %d 个 imapi 响应、%d 个 douyin 响应"
-                    % (len(store.get("imapi_calls", [])), len(store.get("all_calls", []))))
-    except Exception:
-        pass
+    # 等待页面会话列表渲染
+    time.sleep(3)
 
-    # 1) 等待列表接口（监听器在导航期间异步触发，这里兜底等一下）
-    list_bytes = store.get("list")
-    if not list_bytes:
-        for _ in range(10):
-            time.sleep(1.5)
-            if store.get("list"):
-                break
-    if not list_bytes:
-        logger.warning("未捕获到会话列表，尝试主动再捕一次")
-        list_bytes = capture_conversations(page, timeout_ms=8000)
-    if not list_bytes:
-        logger.error("未能捕获到会话列表接口！将仅尝试按昵称兜底（可能不稳定）")
-    else:
-        logger.info("已获得会话列表 (%d bytes)" % len(list_bytes))
-
-    # 2) 解析会话
-    conversations = parse_conversations(list_bytes) if list_bytes else []
+    # 1) 从 DOM 抓取会话列表（核心）
+    dom_items = scrape_conversations_dom(page)
+    logger.info("从 DOM 抓取到 %d 个会话条目" % len(dom_items))
     try:
         with open("logs/conversations.json", "w", encoding="utf-8") as fp:
-            json.dump(conversations, fp, ensure_ascii=False, indent=2)
+            json.dump(dom_items, fp, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    logger.info("从列表解析到 %d 个会话对象" % len(conversations))
 
     by_short = {}
     by_name = {}
-    for c in conversations:
-        if c.get("short_id"):
-            by_short[c["short_id"]] = c
-        if c.get("user_id") and c["user_id"] not in by_short:
-            by_short[c["user_id"]] = c
-        if c.get("nickname"):
-            by_name[c["nickname"]] = c
-
+    for it in dom_items:
+        nm = it.get("nickname")
+        cid = it.get("conversation_id")
+        uid = it.get("uid")
+        if uid:
+            by_short[uid] = {"nickname": nm, "conversation_id": cid, "uid": uid}
+        if nm:
+            by_name[nm] = {"nickname": nm, "conversation_id": cid, "uid": uid}
+    # 兼容 userIDDict（旧逻辑可能填好的昵称）
     for sid, info in (user_id_dict or {}).items():
         nm = info.get("nickname")
         if nm and nm not in by_name:
-            by_name[nm] = {"nickname": nm, "conversation_id": None, "short_id": str(sid)}
+            by_name[nm] = {"nickname": nm, "conversation_id": None, "uid": str(sid)}
 
     fail_count = 0
     sent_count = 0
