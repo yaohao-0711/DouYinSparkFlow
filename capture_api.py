@@ -11,13 +11,15 @@ config = get_config()
 userData = get_userData()
 logger = setup_logger(level="Debug")
 
-CAPTURE = []
+ALL_URLS = []          # 全部请求 URL（不过滤）
+DETAIL = []            # 与私信相关的详细请求/响应
 SEND_RESULT = None
 
 
 def on_request(request):
     url = request.url
-    if "imapi.snssdk.com" in url or "aweme/v1" in url or "snssdk.com/aweme" in url:
+    ALL_URLS.append(f"{request.method} {url}")
+    if "imapi.snssdk.com" in url or "aweme/v1" in url or "snssdk.com/aweme" in url or "im.douyin.com" in url:
         h = dict(request.headers)
         keep = {
             k: h[k]
@@ -34,7 +36,7 @@ def on_request(request):
                 "authorization",
             )
         }
-        CAPTURE.append(
+        DETAIL.append(
             {
                 "type": "request",
                 "method": request.method,
@@ -48,16 +50,16 @@ def on_request(request):
 
 def on_response(response):
     url = response.url
-    if "imapi.snssdk.com" in url:
+    if "imapi.snssdk.com" in url or "im.douyin.com" in url:
         body = ""
         try:
-            body = response.text()[:3000]
+            body = response.text()[:4000]
         except Exception as e:
             body = f"<err {e}>"
-        CAPTURE.append(
+        DETAIL.append(
             {"type": "response", "status": response.status, "url": url, "body_preview": body}
         )
-        logger.info(f"[RES] {response.status} {url}")
+        logger.info(f"[RES] {status={response.status}] {url}")
 
 
 def main():
@@ -75,17 +77,29 @@ def main():
         page.goto("https://creator.douyin.com/", wait_until="domcontentloaded")
         context.add_cookies(cookies)
         time.sleep(2)
-        page.goto(
-            "https://creator.douyin.com/creator-micro/data/following/chat",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        # 等待页面拉取私信列表（产生 imapi 请求）
-        time.sleep(12)
 
-        # 从已捕获的 GET 响应里尝试提取 conversation_id / peer_user_id
+        # 尝试多个候选私信地址
+        candidates = [
+            "https://creator.douyin.com/creator-micro/data/following/chat",
+            "https://creator.douyin.com/creator-micro/im/",
+            "https://im.douyin.com/",
+            "https://creator.douyin.com/creator-micro/data/message",
+        ]
+        for url in candidates:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                logger.info(f"已导航到 {url} ，当前 page.url={page.url}")
+                time.sleep(8)
+            except Exception as e:
+                logger.warning(f"导航 {url} 失败: {e}")
+
+        # 记录 iframe
+        frames = [f.url for f in page.frames]
+        logger.info(f"frames: {frames}")
+
+        # 从已捕获的响应里提取 conversation_id / peer_user_id
         conv_id = peer_id = None
-        for c in CAPTURE:
+        for c in DETAIL:
             if c.get("type") == "response" and "body_preview" in c:
                 bp = c["body_preview"]
                 m = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', bp)
@@ -94,14 +108,13 @@ def main():
                 m = re.search(r'"(?:peer_user_id|to_user_id)"\s*:\s*(\d+)', bp)
                 if m and not peer_id:
                     peer_id = m.group(1)
-
         logger.info(f"提取到 conv_id={conv_id} peer_id={peer_id}")
 
-        # 尝试用刚捕获的 GET 请求头（含 X-Gorgon）重放一个 send 请求
+        # 重放 send
         get_req = next(
             (
                 c
-                for c in CAPTURE
+                for c in DETAIL
                 if c["type"] == "request"
                 and c["method"] == "GET"
                 and "x-gorgon" in c.get("headers", {})
@@ -130,16 +143,18 @@ def main():
         with open("logs/api_capture.json", "w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "capture": CAPTURE,
+                    "all_urls": ALL_URLS,
+                    "detail": DETAIL,
                     "send_result": SEND_RESULT,
                     "conv_id": conv_id,
                     "peer_id": peer_id,
+                    "final_page_url": page.url,
                 },
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
-        logger.info(f"capture saved, 共 {len(CAPTURE)} 条请求记录")
+        logger.info(f"capture saved, 全部请求 {len(ALL_URLS)} 条, 私信相关 {len(DETAIL)} 条")
     finally:
         browser.close()
         playwright.stop()
