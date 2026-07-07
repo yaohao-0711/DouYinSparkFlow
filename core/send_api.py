@@ -1,16 +1,12 @@
 """
-send_api.py — 抖音续火花「抗改版」发送模块 (v2)
-=============================================
-设计目标（一劳永逸）：
-1. 在导航到聊天页【之前】就挂上响应监听器，捕获私信列表接口
-   （imapi.douyin.com 的 conversation/list，可能是 protobuf 或 JSON）。
-2. 解析出「好友(short_id/nickname) -> conversation_id」映射，
-   彻底去掉原来依赖 XPath 点击「好友标签页」的脆弱逻辑。
-3. 对每个目标好友，优先按 conversation_id 直接打开会话（最稳，不依赖 DOM），
-   失败再按好友昵称文本点击（文本匹配抗布局改版）。
-4. 原生输入框发送（fill + Enter，run 10 已验证可送达）。
-5. 所有日志统一写入 logs/app.log；任何好友未成功发送则抛异常，
-   让 workflow 真正标记失败（不再出现“假成功”）。
+send_api.py — 抖音续火花「抗改版」发送模块 (v2.1 诊断增强)
+=========================================================
+本轮重点：把聊天页加载期间所有 imapi.douyin.com 响应（URL + 完整 body）
+都落盘到 logs/imapi/，用于离线定位“会话列表”真实接口与报文格式，
+下一轮再据此写精确的 conversation_id 解析。同时保留：
+- 优先 conversation_id 打开会话；失败按昵称文本点击（抗布局改版）。
+- 原生输入框发送 + 送达校验。
+- 任意好友失败则抛异常，让 workflow 真正标记失败（杜绝假成功）。
 """
 
 import time
@@ -25,7 +21,7 @@ logger = setup_logger("send_api", level="Info")
 
 
 # ---------------------------------------------------------------------------
-# 通用 protobuf 解码器（用于诊断/解析列表接口）
+# 通用 protobuf 解码器
 # ---------------------------------------------------------------------------
 def _read_varint(b, p):
     shift = 0
@@ -98,7 +94,6 @@ def decode_proto_text(b):
 
 
 def _all_strings(nodes):
-    """递归收集所有可读字符串叶子。"""
     res = []
     for nd in nodes:
         f, t, v = nd[0], nd[1], nd[2]
@@ -132,12 +127,10 @@ def _looks_like_name(s):
 
 
 def _extract_conversation_id(strings):
-    """conversation_id 形如 0:1:277555714458343:...（含冒号的长串）。"""
     for s in strings:
         m = re.search(r"\d+:\d+:\d+:\d+", s)
         if m:
             return m.group(0)
-    # 个别接口可能直接给纯数字会话 id（兜底）
     for s in strings:
         m = re.search(r"\b(\d{15,22})\b", s)
         if m:
@@ -181,14 +174,12 @@ def _json_conversations(data):
     if isinstance(data, list):
         candidates = [x for x in data if isinstance(x, dict)]
     elif isinstance(data, dict):
-        # 常见包裹结构：data['data']['conversation_list'] / ['conversation_list'] / ['list']
         for key in ("conversation_list", "list", "conversations", "data"):
             v = data.get(key)
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 candidates = v
                 break
         if not candidates:
-            # 退而求其次：把整个 data 当成一个会话
             candidates = [data]
     out = []
     for c in candidates:
@@ -209,11 +200,9 @@ def _json_conversations(data):
 
 
 def parse_conversations(list_bytes):
-    """返回会话对象列表：[{conversation_id, short_id, user_id, nickname, _all_strings}]"""
     out = []
     if not list_bytes:
         return out
-    # 1) 先尝试 JSON
     stripped = list_bytes.lstrip()
     if stripped[:1] in (b"{", b"["):
         try:
@@ -223,7 +212,6 @@ def parse_conversations(list_bytes):
                 return convs
         except Exception:
             pass
-    # 2) protobuf 路径
     try:
         nodes = _decode_proto(list_bytes)
     except Exception:
@@ -253,39 +241,60 @@ def parse_conversations(list_bytes):
 
 
 # ---------------------------------------------------------------------------
-# 列表接口捕获（在导航前挂监听器）
+# 列表接口捕获（诊断增强：记录所有 imapi 响应）
 # ---------------------------------------------------------------------------
-def install_list_capture(page, store, timeout_ms=8000):
+def install_list_capture(page, store):
     """
     必须在 page.goto(chat) 【之前】调用。
-    挂上响应监听器，捕获 conversation/list 接口原始响应。
+    记录聊天页加载期间所有 imapi.douyin.com 响应（URL + 完整 body），
+    同时尝试按常见关键字识别“会话列表”接口。
     """
+    store.setdefault("all_calls", [])
+    store.setdefault("imapi_calls", [])
+    store.setdefault("idx", 0)
+
     def on_response(response):
         url = response.url
         try:
-            if (
-                "imapi.douyin.com" in url
-                and ("conversation" in url or "/list" in url or "get_by_user" in url)
-                and store.get("list") is None
-            ):
+            if "douyin.com" in url:
+                store["all_calls"].append({
+                    "url": url, "status": response.status,
+                })
+            if "imapi.douyin.com" in url:
                 try:
-                    body = response.body()
+                    body = response.body() or b""
                 except Exception:
                     body = b""
-                store["list"] = body or b""
-                store["list_url"] = url
-                try:
-                    os.makedirs("logs", exist_ok=True)
-                    open("logs/list_proto.bin", "wb").write(store["list"])
-                    open("logs/list_proto.txt", "w", encoding="utf-8").write(
-                        decode_proto_text(store["list"])
-                    )
-                    open("logs/list_strings.txt", "w", encoding="utf-8").write(
-                        "\n".join(_all_strings(_decode_proto(store["list"])))
-                    )
-                    logger.info("已捕获会话列表接口：%s (%d bytes)" % (url, len(store["list"])))
-                except Exception as e:
-                    logger.warning("写入列表日志失败: %r" % e)
+                idx = store["idx"]
+                store["idx"] += 1
+                store["imapi_calls"].append({
+                    "i": idx, "url": url, "status": response.status, "len": len(body),
+                })
+                # 落盘所有 imapi 响应体，供离线分析（限大小/数量）
+                if idx <= 40 and len(body) <= 300 * 1024:
+                    try:
+                        os.makedirs("logs/imapi", exist_ok=True)
+                        open("logs/imapi/%d.bin" % idx, "wb").write(body)
+                    except Exception:
+                        pass
+                # 尝试识别会话列表
+                if store.get("list") is None and (
+                    "conversation" in url or "/list" in url or "get_by_user" in url
+                ):
+                    store["list"] = body
+                    store["list_url"] = url
+                    try:
+                        os.makedirs("logs", exist_ok=True)
+                        open("logs/list_proto.bin", "wb").write(body)
+                        open("logs/list_proto.txt", "w", encoding="utf-8").write(
+                            decode_proto_text(body)
+                        )
+                        open("logs/list_strings.txt", "w", encoding="utf-8").write(
+                            "\n".join(_all_strings(_decode_proto(body)))
+                        )
+                        logger.info("已捕获会话列表接口：%s (%d bytes)" % (url, len(body)))
+                    except Exception as e:
+                        logger.warning("写入列表日志失败: %r" % e)
         except Exception:
             pass
 
@@ -294,7 +303,6 @@ def install_list_capture(page, store, timeout_ms=8000):
 
 
 def capture_conversations(page, timeout_ms=8000):
-    """兜底：若提前监听器没拿到，主动挂监听器等待一段时间。"""
     captured = {}
 
     def on_response(response):
@@ -306,18 +314,18 @@ def capture_conversations(page, timeout_ms=8000):
                 and captured.get("list") is None
             ):
                 try:
-                    body = response.body()
+                    body = response.body() or b""
                 except Exception:
                     body = b""
-                captured["list"] = body or b""
+                captured["list"] = body
                 try:
                     os.makedirs("logs", exist_ok=True)
-                    open("logs/list_proto.bin", "wb").write(captured["list"])
+                    open("logs/list_proto.bin", "wb").write(body)
                     open("logs/list_proto.txt", "w", encoding="utf-8").write(
-                        decode_proto_text(captured["list"])
+                        decode_proto_text(body)
                     )
                     open("logs/list_strings.txt", "w", encoding="utf-8").write(
-                        "\n".join(_all_strings(_decode_proto(captured["list"])))
+                        "\n".join(_all_strings(_decode_proto(body)))
                     )
                 except Exception:
                     pass
@@ -336,10 +344,8 @@ def capture_conversations(page, timeout_ms=8000):
 # 打开会话并原生发送
 # ---------------------------------------------------------------------------
 def click_by_text(page, text):
-    """按好友昵称文本点击会话（抗布局改版兜底方案）。返回是否成功。"""
     if not text:
         return False
-    # 多套策略，由稳到宽
     strategies = [
         "xpath=//*[contains(@class,'conversation') or contains(@class,'list') or contains(@class,'item')]//*[contains(text(), '%s')]" % text,
         "xpath=//li[contains(., '%s')]" % text,
@@ -361,9 +367,6 @@ def click_by_text(page, text):
 
 
 def open_conversation(page, conversation_id, chat_url, friend_display):
-    """
-    打开指定会话。优先用 conversation_id 直接打开（最稳），失败则按好友名点击。
-    """
     if conversation_id:
         try:
             url = "%s?conversation_id=%s" % (chat_url, conversation_id)
@@ -385,7 +388,6 @@ def open_conversation(page, conversation_id, chat_url, friend_display):
 
 
 def native_send(page, message, config):
-    """在已打开的会话里输入并发送。"""
     chat_input_selector = "xpath=//div[contains(@class, 'chat-input-')]"
     page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
     chat_input = page.locator(chat_input_selector)
@@ -395,7 +397,6 @@ def native_send(page, message, config):
 
 
 def verify_delivery(page, friend_display):
-    """送达校验：检测页面是否出现失败提示。"""
     try:
         fail_xpath = (
             "xpath=//*[contains(text(),'发送失败') "
@@ -414,30 +415,42 @@ def verify_delivery(page, friend_display):
         return True
     except Exception as e:
         logger.warning("送达校验异常: %r" % e)
-        return True  # 校验异常不计入失败
+        return True
 
 
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn, config, list_store=None):
-    """
-    抗改版主流程：
-    1. 拿到会话列表 -> 解析出好友->会话映射
-    2. 逐好友：优先 conversation_id 打开，否则按昵称点击；原生发送；送达校验
-    3. 任意好友失败则抛异常，让 workflow 标记失败（杜绝假成功）
-    """
     chat_url = "https://creator.douyin.com/creator-micro/data/following/chat"
     account_name = config.get("_account_name", "账号")
     os.makedirs("logs", exist_ok=True)
+    store = list_store or {}
 
-    # 1) 取得列表原始数据
-    list_bytes = (list_store or {}).get("list")
+    # 0) 保存诊断清单（所有 douyin / imapi 调用）
+    try:
+        with open("logs/imapi_calls.json", "w", encoding="utf-8") as fp:
+            json.dump({
+                "all_douyin_calls": store.get("all_calls", []),
+                "imapi_calls": store.get("imapi_calls", []),
+            }, fp, ensure_ascii=False, indent=2)
+        logger.info("诊断：捕获到 %d 个 imapi 响应、%d 个 douyin 响应"
+                    % (len(store.get("imapi_calls", [])), len(store.get("all_calls", []))))
+    except Exception:
+        pass
+
+    # 1) 等待列表接口（监听器在导航期间异步触发，这里兜底等一下）
+    list_bytes = store.get("list")
     if not list_bytes:
-        logger.warning("未通过提前监听器拿到列表，尝试主动捕获一次")
+        for _ in range(10):
+            time.sleep(1.5)
+            if store.get("list"):
+                break
+    if not list_bytes:
+        logger.warning("未捕获到会话列表，尝试主动再捕一次")
         list_bytes = capture_conversations(page, timeout_ms=8000)
     if not list_bytes:
-        logger.error("未能捕获到会话列表接口，无法建立好友->会话映射！将仅尝试按昵称兜底（可能不稳定）")
+        logger.error("未能捕获到会话列表接口！将仅尝试按昵称兜底（可能不稳定）")
     else:
         logger.info("已获得会话列表 (%d bytes)" % len(list_bytes))
 
@@ -450,7 +463,6 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
         pass
     logger.info("从列表解析到 %d 个会话对象" % len(conversations))
 
-    # 建立查找表
     by_short = {}
     by_name = {}
     for c in conversations:
@@ -461,7 +473,6 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
         if c.get("nickname"):
             by_name[c["nickname"]] = c
 
-    # 兼容旧逻辑可能填好的 userIDDict（按昵称兜底）
     for sid, info in (user_id_dict or {}).items():
         nm = info.get("nickname")
         if nm and nm not in by_name:
@@ -500,7 +511,6 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
             fail_count += 1
             continue
 
-        # 降速，避免触发频率限制
         send_interval = int(config.get("sendInterval", 8000)) / 1000
         time.sleep(send_interval)
 
