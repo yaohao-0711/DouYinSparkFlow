@@ -59,7 +59,7 @@ def on_response(response):
         DETAIL.append(
             {"type": "response", "status": response.status, "url": url, "body_preview": body}
         )
-        logger.info(f"[RES] {status={response.status}] {url}")
+        logger.info(f"[RES] status={response.status} {url}")
 
 
 def main():
