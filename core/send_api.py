@@ -71,14 +71,14 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
     except Exception as e:
         logger.error(f"[{account}] DOM 导出失败: {e}")
 
-    # ---- 导出候选条目摘要（含 href 与 HTML 片段，便于定位好友 id）----
+    # ---- 导出候选条目摘要（含属性、href、HTML 片段、输入框，便于定位好友 id 与搜索框）----
     try:
         summary = page.evaluate("""() => {
-            const out = [];
+            const items = [];
             const seen = new Set();
-            const sel = 'li, [role=listitem], a, div[role=button], [class*=list-item], [class*=conversation], [class*=item]';
-            const items = document.querySelectorAll(sel);
-            for (const el of items) {
+            const sel = 'li, [role=listitem], a, div[role=button], [class*=list-item], [class*=conversation], [class*=item], [class*=chat], [class*=friend]';
+            const nodes = document.querySelectorAll(sel);
+            for (const el of nodes) {
                 const txt = (el.innerText || '').replace(/\\s+/g, ' ').trim();
                 if (!txt) continue;
                 if (txt.length > 80) continue;
@@ -88,14 +88,24 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
                 const cls = (typeof el.className === 'string') ? el.className : '';
                 const a = el.querySelector('a') || el;
                 const href = (a.getAttribute && a.getAttribute('href')) || '';
-                out.push({ tag: el.tagName, cls: cls.slice(0,140), text: txt.slice(0,70), href: href.slice(0,120), html: (el.outerHTML||'').slice(0,400) });
-                if (out.length > 500) break;
+                const attrs = {};
+                if (el.getAttributeNames) {
+                    for (const n of el.getAttributeNames()) {
+                        if (n.startsWith('data-') || n === 'id' || n === 'href') attrs[n] = (el.getAttribute(n)||'').slice(0,160);
+                    }
+                }
+                items.push({ tag: el.tagName, cls: cls.slice(0,160), text: txt.slice(0,70), href: href.slice(0,160), attrs, html: (el.outerHTML||'').slice(0,800) });
+                if (items.length > 600) break;
             }
-            return { url: location.href, items: out };
+            const inputs = [];
+            for (const el of document.querySelectorAll('input, textarea, [contenteditable=true]')) {
+                inputs.push({ tag: el.tagName, type: el.getAttribute('type')||'', placeholder: el.getAttribute('placeholder')||'', name: el.getAttribute('name')||'', id: el.id||'', cls: (typeof el.className==='string'?el.className:'').slice(0,140) });
+            }
+            return { url: location.href, items, inputs };
         }""")
         with open("logs/dom_summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
-        logger.info(f"[{account}] 已导出 dom_summary.json，候选条目 {len(summary.get('items', []))}")
+        logger.info(f"[{account}] 已导出 dom_summary.json，候选条目 {len(summary.get('items', []))}，输入框 {len(summary.get('inputs', []))}")
     except Exception as e:
         logger.error(f"[{account}] dom_summary 导出失败: {e}")
 
