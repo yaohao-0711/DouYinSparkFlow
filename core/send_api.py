@@ -44,26 +44,23 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
     page.on("response", on_resp)
 
     # ---- 等待聊天页渲染 ----
-    logger.info(f"[{account}] 等待聊天页加载 (5s)...")
-    time.sleep(5)
+    logger.info(f"[{account}] 等待聊天页加载 (6s)...")
+    time.sleep(6)
 
-    # ---- 登录态检测（Cookie 失效是最常见的根因）----
+    # ---- 登录态检测（基于真实重定向，避免误判）----
+    page_url = page.url
+    logger.info(f"[{account}] 当前页面 URL: {page_url}")
     try:
-        is_login = page.evaluate("""() => {
-            const txt = (document.body && document.body.innerText) || '';
-            const loginMark = /扫码登录|验证码登录|密码登录|登录或注册/.test(txt);
-            const loginCard = !!document.querySelector('[class*=login-card], [class*=douyin_login], [class*=passport]');
-            return loginMark || loginCard;
-        }""")
-    except Exception as e:
-        logger.warning(f"[{account}] 登录态检测异常: {e}")
-        is_login = False
-
-    if is_login:
-        logger.error(f"[{account}] !!! 未登录：页面停留在抖音登录界面，Cookie 已失效/过期/域名不匹配")
-        logger.error(f"[{account}] !!! 请重新从 creator.douyin.com 导出 Cookie（Cookie-Editor 插件），并更新 GitHub Secret COOKIES_28860838926")
-        logger.error(f"[{account}] !!! 未登录时无法发送任何消息，流程终止")
+        body_text = page.evaluate("() => (document.body ? document.body.innerText : '')") or ""
+    except Exception:
+        body_text = ""
+    logger.info(f"[{account}] 页面文本(前1000字): {body_text[:1000]}")
+    is_login_page = ("passport" in page_url.lower()) or ("login" in page_url.lower() and "creator-micro" not in page_url.lower())
+    if is_login_page:
+        logger.error(f"[{account}] !!! 未登录：页面被重定向到登录页 ({page_url})，Cookie 已失效")
+        logger.error(f"[{account}] !!! 请重新从 creator.douyin.com 导出 Cookie 并更新 GitHub Secret COOKIES_28860838926")
         raise RuntimeError(f"[{account}] 未登录，Cookie 失效，请更新 COOKIES_28860838926")
+    logger.info(f"[{account}] 页面未被重定向到登录页，视为已登录（继续）")
 
     # ---- 导出完整 DOM ----
     try:
@@ -74,7 +71,7 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
     except Exception as e:
         logger.error(f"[{account}] DOM 导出失败: {e}")
 
-    # ---- 导出候选条目摘要 ----
+    # ---- 导出候选条目摘要（含 href 与 HTML 片段，便于定位好友 id）----
     try:
         summary = page.evaluate("""() => {
             const out = [];
@@ -89,7 +86,9 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
                 if (seen.has(key)) continue;
                 seen.add(key);
                 const cls = (typeof el.className === 'string') ? el.className : '';
-                out.push({ tag: el.tagName, cls: cls.slice(0, 140), text: txt.slice(0, 70) });
+                const a = el.querySelector('a') || el;
+                const href = (a.getAttribute && a.getAttribute('href')) || '';
+                out.push({ tag: el.tagName, cls: cls.slice(0,140), text: txt.slice(0,70), href: href.slice(0,120), html: (el.outerHTML||'').slice(0,400) });
                 if (out.length > 500) break;
             }
             return { url: location.href, items: out };
