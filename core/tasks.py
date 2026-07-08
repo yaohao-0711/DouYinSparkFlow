@@ -222,11 +222,23 @@ def do_user_task(browser, username, cookies, targets):
         context.set_default_timeout(config["browserTimeout"])  # 设置所有操作的默认超时时间为 120 秒
 
         page = context.new_page()
-        
+
         if matchMode == "short_id":  # 使用抖音号进行匹配
             page.on("response", handle_response)
-        
-        # 打开抖音创作者中心
+
+        # 【关键修复】先注入 Cookie 再导航（标准做法）。
+        # 之前是「先 goto 首页(无 Cookie) 再 add_cookies」，部分情况下 Cookie 不生效；
+        # 改为导航前注入，确保后续每次请求都携带登录态。
+        try:
+            context.add_cookies(cookies)
+            stored = context.cookies("https://creator.douyin.com")
+            logger.info(f"账号 {username} Cookie 注入成功，上下文已存 {len(stored)} 个 Cookie")
+        except Exception as e:
+            logger.error(f"账号 {username} Cookie 注入失败: {e}")
+            context.close()
+            raise
+
+        # 打开抖音创作者中心（此时已带登录态 Cookie）
         retry_operation(
             "打开抖音创作者中心",
             page.goto,
@@ -234,8 +246,6 @@ def do_user_task(browser, username, cookies, targets):
             delay=5,
             url="https://creator.douyin.com/",
         )
-        # 注入 Cookie
-        context.add_cookies(cookies)
 
         # 导航到消息页面
         retry_operation(

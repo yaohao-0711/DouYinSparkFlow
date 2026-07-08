@@ -59,10 +59,35 @@ def get_config():
     return config
 
 def sanitize_cookies(cookies):
+    """
+    把 Cookie-Editor 导出的格式规整为 Playwright 完全兼容的格式。
+    关键点：
+    - 去掉 Playwright 不识别的字段（sameSite / hostOnly / storeId / session）
+    - 域名去掉前导点（部分 Playwright 版本对 ".douyin.com" 处理不一致，统一成 "douyin.com"）
+    - 把 Cookie-Editor 的 expirationDate(浮点) 转成 Playwright 需要的 expires(整数秒)
+    - 确保 path / secure / httpOnly 字段类型正确
+    """
+    out = []
     for cookie in cookies:
-        if "sameSite" in cookie:
-            cookie.pop("sameSite")  # 移除 sameSite 字段，Playwright 可能不支持该字段
-    return cookies
+        c = dict(cookie)
+        c.pop("sameSite", None)
+        c.pop("hostOnly", None)
+        c.pop("storeId", None)
+        c.pop("session", None)
+        if "expirationDate" in c:
+            try:
+                c["expires"] = int(float(c["expirationDate"]))
+            except (TypeError, ValueError):
+                pass
+            c.pop("expirationDate", None)
+        if c.get("domain", "").startswith("."):
+            c["domain"] = c["domain"][1:]
+        if not c.get("path"):
+            c["path"] = "/"
+        c["secure"] = bool(c.get("secure", False))
+        c["httpOnly"] = bool(c.get("httpOnly", False))
+        out.append(c)
+    return out
 
 
 def get_userData():

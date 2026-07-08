@@ -47,20 +47,52 @@ def discover_and_send(page, targets, user_id_dict, match_mode, build_message_fn,
     logger.info(f"[{account}] 等待聊天页加载 (6s)...")
     time.sleep(6)
 
-    # ---- 登录态检测（基于真实重定向，避免误判）----
+    # ---- 登录态检测（基于页面正文，避免被 SPA 同 URL 登录页骗过）----
     page_url = page.url
     logger.info(f"[{account}] 当前页面 URL: {page_url}")
     try:
         body_text = page.evaluate("() => (document.body ? document.body.innerText : '')") or ""
     except Exception:
         body_text = ""
-    logger.info(f"[{account}] 页面文本(前1000字): {body_text[:1000]}")
-    is_login_page = ("passport" in page_url.lower()) or ("login" in page_url.lower() and "creator-micro" not in page_url.lower())
-    if is_login_page:
-        logger.error(f"[{account}] !!! 未登录：页面被重定向到登录页 ({page_url})，Cookie 已失效")
+    logger.info(f"[{account}] 页面文本(前500字): {body_text[:500]}")
+
+    login_markers = ["扫码登录", "验证码登录", "密码登录", "登录/注册", "登录或注册",
+                     "请登录", "账号密码登录", "短信登录", "二维码登录"]
+    hit_marker = next((m for m in login_markers if m in body_text), None)
+    url_is_login = ("passport" in page_url.lower()) or (
+        "login" in page_url.lower() and "creator-micro" not in page_url.lower()
+    )
+    if hit_marker or url_is_login:
+        logger.error(f"[{account}] !!! 未登录：页面显示登录界面（命中 '{hit_marker}'），Cookie 未生效/已失效")
         logger.error(f"[{account}] !!! 请重新从 creator.douyin.com 导出 Cookie 并更新 GitHub Secret COOKIES_28860838926")
         raise RuntimeError(f"[{account}] 未登录，Cookie 失效，请更新 COOKIES_28860838926")
-    logger.info(f"[{account}] 页面未被重定向到登录页，视为已登录（继续）")
+
+    # ---- 决定性校验：直接调用抖音用户接口，确认 Cookie 在【当前运行环境】真的有效 ----
+    # 仅看页面是否显示登录框不够——还需确认服务端认可这批 Cookie（排除异地 IP 风控等）。
+    try:
+        api = page.evaluate(
+            "() => fetch('https://creator.douyin.com/aweme/v1/creator/user/info/', "
+            "{credentials:'include'}).then(r=>r.json()).catch(e=>({__err:String(e)}))"
+        )
+        logger.info(f"[{account}] 用户接口返回: {json.dumps(api, ensure_ascii=False)[:300]}")
+        if isinstance(api, dict) and api.get("status_code") == 0 and api.get("nick_name"):
+            logger.info(
+                f"[{account}] ✓ Cookie 校验通过，当前登录用户: {api.get('nick_name')} "
+                f"(unique_id={api.get('douyin_unique_id')})"
+            )
+        else:
+            logger.error(
+                f"[{account}] ✗ Cookie 在当前环境被抖音拒绝（接口未返回有效用户），"
+                f"可能 Cookie 失效或异地 IP 风控"
+            )
+            raise RuntimeError(
+                f"[{account}] Cookie 在当前运行环境无效（接口校验失败），"
+                f"请更新 COOKIES_28860838926 或改用本机运行"
+            )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.warning(f"[{account}] 用户接口校验异常（不阻断后续）: {e}")
 
     # ---- 导出完整 DOM ----
     try:
